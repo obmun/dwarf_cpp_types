@@ -3,6 +3,7 @@ import logging
 import numpy as np
 import sys
 import typing as t
+from bidict import bidict
 from pathlib import Path
 from typing import Annotated
 from annotated_types import Ge
@@ -21,7 +22,7 @@ class Scope:
     """Anything that can contain other elements
     """
     _name: str
-    structs: dict[str, 'StructDefinition']
+    structs: dict[str, 'StructType']
 
     def __init__(self, name: str):
         self._name = name
@@ -37,6 +38,7 @@ class Namespace(Scope):
 
     (and other nested scoped through the `ScopeGraph`)
     """
+
     def __init__(self, name: str):
         super().__init__(name)
 
@@ -70,7 +72,6 @@ class ScopeGraphNode:
         self._children.append(new_child)
         return new_child
 
-
     @property
     def depth(self) -> UInt:
         return self._depth
@@ -82,7 +83,7 @@ class ScopeGraphNode:
 
 
 class StructScopeGraphNode(ScopeGraphNode):
-    scope: 'StructDefinition'
+    scope: 'StructType'
 
 
 class ScopeGraph:
@@ -96,15 +97,19 @@ class ScopeGraph:
         return self._root
 
 
-class StructDefinition(Scope):
-    """A definition of a struct, containing various fields
+scope_to_die_map: bidict['ScopeGraphNode', DIE] = bidict()
+scope_graph = ScopeGraph()
 
-    Note that a `StructDefinition` is also a `Scope`. It can then also contain other "scopes". The nested scopes are handled through the "scope" graph.
+
+# ^^ TODO: move these 2 to a class
+
+
+class StructDefinition():
+    """A definition of a struct, containing various fields
     """
     fields: dict[str, 'TypeDef']
 
-    def __init__(self, name: str):
-        super().__init__(name)
+    def __init__(self):
         self.fields = {}
 
 
@@ -130,8 +135,6 @@ def extract_types(filename, types: t.Optional[list[str]] = None):
 
     :param types: a list of types to recover. If not provided, all types will be extracted
     """
-
-    scope_graph = ScopeGraph()
 
     print('Processing file:', filename)
     with open(filename, 'rb') as f:
@@ -160,23 +163,61 @@ class TypeDef:
     """
     _cpp_decl: str
 
-    def __init__(self, name:str):
-        self._cpp_decl = name
+    def __init__(self, cpp_decl: str):
+        self._cpp_decl = cpp_decl
 
     @property
     def cpp_decl(self) -> str:
         return self._cpp_decl
 
 
+# TODO: complete the concept of a qualifier
+class Qualifier:
+    pass
+
+
+class QualifiedType(TypeDef):
+    """A TypeDef with qualifiers
+
+    """
+
+    qualifiers: list[Qualifier]
+
+
 class PrimitiveType(TypeDef):
     value: t.Any
 
-    def __init__(self, value, name:str):
-        super().__init__(name)
+    def __init__(self, value, cpp_decl: str):
+        super().__init__(cpp_decl)
         self.value = value
 
     def __str__(self):
         return f'PrimitiveType({self.value})'
+
+
+class Enumeration(TypeDef):
+    _underlying_type: None | PrimitiveType
+    _values: dict[str, t.Any]
+
+    def __init__(self, cpp_decl: str):
+        super().__init__(cpp_decl)
+        self._values = {}
+        self._underlying_type = None
+
+
+class Reference(TypeDef):
+    """A type definition that is a reference to another type definition
+
+    """
+    _dest: TypeDef
+
+    def __init__(self, dest: TypeDef):
+        super().__init__(dest.cpp_decl)
+        self._dest = dest
+
+    @property
+    def dest(self):
+        return self._dest
 
 
 class CompoundType(TypeDef):
@@ -185,10 +226,25 @@ class CompoundType(TypeDef):
     pass
 
 
-class StructType(CompoundType):
+class StructType(CompoundType, Scope):
     """A class or struct type in C++
+
+    Note that a `StructDefinition` is also a `Scope`. It can then also contain other "scopes". The nested scopes are handled through the "scope" graph.
     """
-    pass
+
+    definition: StructDefinition
+
+    def __init__(self, definition: StructDefinition, name: str):
+        """
+        A struct type does NOT have a "cpp_decl". It's declaration is just simply the C++ struct declaration syntax
+
+        :param definition:
+        :param name: The scope name
+        """
+        CompoundType.__init__(self, f'struct {name}')
+        # ^^^ TODO: add the ClassType, and replace this hardcoded struct with class keyword
+        Scope.__init__(self, name)
+        self.definition = definition
 
 
 class Container(TypeDef):
@@ -227,11 +283,13 @@ class SharedPtr(TypeDef):
     pass
 
 
-def dwarf_base_type_to_py_type(die: DIE):
+def dwarf_base_type_to_py_type(die: DIE) -> PrimitiveType:
     assert die.tag == 'DW_TAG_base_type'
 
     mapping = {
         (dc.DW_ATE_boolean, 1): np.bool_,
+        (dc.DW_ATE_unsigned_char, 1): np.ubyte,  # According to NumPy doc (https://numpy.org/doc/stable/user/basics
+        # .types.html), ubyte is equivalent to unsigned char. Review if this is the correct assingment
         (dc.DW_ATE_signed, 1): np.int8,
         (dc.DW_ATE_signed, 2): np.int16,
         (dc.DW_ATE_signed, 4): np.int32,
@@ -254,28 +312,94 @@ def dwarf_base_type_to_py_type(die: DIE):
                          die.attributes['DW_AT_name'].value.decode('utf-8'))
 
 
-def process_type_die(die: DIE, scope: ScopeGraphNode):
+def process_type_die(die: DIE, scope: t.Optional[ScopeGraphNode], dependency: bool = False) -> t.Optional[TypeDef]:
+    """
+
+    :param die:
+    :param scope: If None, we will use the PARENT die to find the right SCOPE
+
+    :param dependency: Indicates whether this type is a dependency of other type (e.g., the type of a member of a
+    struct). If True, this type will be imported even if it is not in the whitelist, as some type in its dependees
+    have been whitelisted.
+
+    :return:
+    """
+    parent_die = None
+    if not scope:
+        parent_die = die.get_parent()
+
+    # TODO: here we will always be doing FIRST TIME processing of a type, right? We are processing the DIE type ...
+    # How are we gonna handle references to existing types? ATM we only handle Refs to structs... But I guess we will have refs to EVERYTHING
+
     match die.tag:
         case 'DW_TAG_base_type':
             return dwarf_base_type_to_py_type(die)
         case 'DW_TAG_pointer_type':
             logging.error('cannot handle ptr types yet');
             return None
+
         case 'DW_TAG_typedef':
             logging.error('typedef (alias) support not implemented yet');
             return None
+
         case 'DW_TAG_array_type':
             # !!! Array DIEs normally have children!
-            #raise NotImplementedError("No array support ...")
+            # raise NotImplementedError("No array support ...")
             return None
+
+        case 'DW_TAG_enumeration_type':
+            return process_enum_type(die, scope, dependency)
+
+        case 'DW_TAG_const_type':
+            # A type qualifier is handled as a const_type tag with a NESTED DW_AT_type attribute! (normally a reference)
+            # TODO: implement handling and qualifiers if our Type structures that require it!
+            return None
+
         case tag if tag in CLASS_OR_STRUCT_TYPE_TAGS:
-            process_struct_or_class_type(die, scope)
+            struct_graph_node = process_struct_or_class_type(die, scope, dependency)
+            struct_type = struct_graph_node.scope
+            return Reference(struct_type)
         case other:
             raise RuntimeError('Do not know how to handle type die of type {}'.format(die.tag))
 
 
-def process_type_attr(die: DIE, scope: ScopeGraphNode):
+def process_type_ref(attr: AttributeValue, die: DIE, scope: ScopeGraphNode):
     """
+
+    :param attr:
+    :param die: The parent die
+    :return:
+    """
+    if attr.form != 'DW_FORM_ref4':
+        raise RuntimeError(f'Do not know now how to handle ref of form {attr.form}')
+
+    ref_addr = attr.value + die.cu.cu_offset
+    type_die = die.dwarfinfo.get_DIE_from_refaddr(ref_addr, die.cu)
+
+    parent_die = type_die.get_parent()
+    assert scope in scope_to_die_map
+    given_scope_die = scope_to_die_map[scope]
+    if given_scope_die != parent_die:
+        # This is a reference to a type in a different scope.
+        # 1) We need to parent the referenced type to its CORRECT scope
+        # 2) It might be the case that we have NOT processed yet the parent scope
+
+        if parent_die.tag == 'DW_TAG_compile_unit':
+            # If the real parent is just the CU, this is a non-namespaced type (root) or a base type
+            # Just use the ROOT ns as parent
+            scope = scope_graph.root
+        else:
+            if parent_die not in scope_to_die_map.inverse:
+                # Not processed before! Time to do it now!
+                raise NotImplementedError()
+            else:
+                scope = scope_to_die_map.inverse[parent_die]
+
+    return process_type_die(type_die, scope, True)
+
+
+def process_type_attr(die: DIE, scope: ScopeGraphNode):
+    """Process the attribute that defines the type of this debug info entity
 
     :param die:
     :param scope: The scope (parent struct) of the member field whose type we are processing. If type is a structure, we need to nest it
@@ -284,36 +408,83 @@ def process_type_attr(die: DIE, scope: ScopeGraphNode):
     type_attr = die.attributes['DW_AT_type']
     match type_attr.form:
         case 'DW_FORM_ref4':
-            ref_addr = type_attr.value + die.cu.cu_offset
-            type_die = die.dwarfinfo.get_DIE_from_refaddr(ref_addr, die.cu)
-            return process_type_die(type_die, scope)
+            return process_type_ref(type_attr, die, scope)
         case other:
             raise RuntimeError('Do not know now how to handle type attr of form {}'.format(type_attr.form))
-
-    pass
 
 
 def process_member_die(die: DIE, parent_struct_node: StructScopeGraphNode) -> None:
     assert die.tag == 'DW_TAG_member'
 
-    parent_struct = parent_struct_node.scope
-    indent = BASIC_INDENT*parent_struct_node.depth
+    parent_struct_type = parent_struct_node.scope
+    parent_struct_def = parent_struct_type.definition
+    indent = BASIC_INDENT * parent_struct_node.depth
 
     field_name = die.attributes['DW_AT_name'].value.decode('utf-8')
     type_def = process_type_attr(die, parent_struct_node)
     if not type_def:
-        logging.error("Could not process type for member '{}::{}'. Definition will be incomplete".format(parent_struct.name, field_name))
+        logging.error(
+            "Could not process type for member '{}::{}'. Definition will be incomplete".format(parent_struct_type.name,
+                                                                                               field_name))
 
     print(indent + 'DIE tag=%s, attrs=' % die.tag)
     attr_indent = indent + BASIC_INDENT
-    for name, val in die.attributes.items():
-        print(attr_indent + '  %s = %s' % (name, val))
 
-    assert field_name not in parent_struct.fields
-    parent_struct.fields[field_name] = type_def
+    assert field_name not in parent_struct_def.fields
+    parent_struct_def.fields[field_name] = type_def
 
 
-def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode):
+def process_enum_type(die: DIE, scope_node: ScopeGraphNode, dependency: bool = False) -> None | Enumeration:
+    """
+
+    :param die: This type DIE must NOT have been processed before
+    :param scope_node:
+    :param dependency:
+    :return:
+    """
+    assert die.tag == 'DW_TAG_enumeration_type'
+
+    if 'DW_AT_name' not in die.attributes:
+        logging.info("Ignoring unnamed DIE @{}".format(die.offset))
+        return None
+
+    name = die.attributes['DW_AT_name'].value.decode("utf-8")
+
+    return Enumeration(name)
+
+
+def vector_matcher(type_name: str) -> bool:
+    return type_name.startswith('vector')
+
+
+def vector_processor(die: DIE, parent_struct_node: StructScopeGraphNode):
+    # TODO: extract this. Many container will have a "nested" type. This code is shared
+    nested_type_attr = die.attributes['DW_AT_sibling']
+    assert nested_type_attr.form == 'DW_FORM_ref4'
+    nested_type = process_type_ref(nested_type_attr, die, parent_struct_node)
+    pass
+
+
+# A list  containing the processors for special STL struct/class types
+stl_classes = [
+    (vector_matcher, vector_processor)
+]
+
+
+def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode,
+                                 dependency: bool = False) -> None | ScopeGraphNode:
+    """
+    A struct or class declaration CANNOT be processed twice. Make sure to detect this situation outside this function
+
+    :param die:
+    :param scope_node:
+
+    :param dependency: Indicates whether this type is a dependency of other type (e.g., the type of a member of a
+    struct). If True, this type will be imported even if it is not in the whitelist, as some type in its dependees
+    have been whitelisted.
+
+    :return: The scope graph node that corresponds to this new structure or class.
+    """
     global types_whitelist
 
     assert die.tag in CLASS_OR_STRUCT_TYPE_TAGS
@@ -325,21 +496,30 @@ def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode):
     name = die.attributes['DW_AT_name'].value.decode("utf-8")
 
     full_path = scope_node.get_path() + [name]
-    if full_path not in types_whitelist:
+    if not dependency and (full_path not in types_whitelist):
         return
 
-    struct_def = StructDefinition(name=name)
-    struct_def_node = scope_node.add_child(struct_def)
+    # Generic struct processing
+    struct_def = StructDefinition()
+    struct_type = StructType(struct_def, name)
+    struct_type_node = scope_node.add_child(struct_type)
+    assert struct_type_node not in scope_to_die_map
+    scope_to_die_map[struct_type_node] = die
 
-    for attr_name, attr_val in die.attributes.items():
-        print(indent + '  %s = %s' % (attr_name, attr_val))
+    # The STL types are also structs (classes). We need to apply a matcher on the name
+    for matcher, processor in stl_classes:
+        if matcher(name):
+            processor(die, struct_type_node)
+            break
 
     # The member fields of a struct are provided as child DIEs
     for child_die in die.iter_children():
         if child_die.tag == 'DW_TAG_member':
-            process_member_die(child_die, struct_def_node)
+            process_member_die(child_die, struct_type_node)
 
-    scope_node.scope.structs[name] = struct_def
+    scope_node.scope.structs[name] = struct_type
+
+    return struct_type_node
 
 
 def process_die_recursive(die, scope: ScopeGraphNode):
@@ -363,6 +543,8 @@ def process_die_recursive(die, scope: ScopeGraphNode):
             ns_name = name
             new_ns = Namespace(ns_name)
             scope = scope.add_child(new_ns)
+            assert scope not in scope_to_die_map
+            scope_to_die_map[scope] = die
 
         case t if t in CLASS_OR_STRUCT_TYPE_TAGS:
             process_struct_or_class_type(die, scope)
@@ -386,6 +568,7 @@ if __name__ == '__main__':
         print('Expected usage: {0} <executable>'.format(sys.argv[0]))
         sys.exit(1)
 
+    # Associated types will be automatically brought in
     types_whitelist = [
         ['TopStruct'],
     ]

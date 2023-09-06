@@ -6,6 +6,7 @@ name = "pypi"
 [packages]
 pyelftools = "*"
 numpy = "*"
+bidict = "*"
 
 [dev-packages]
 

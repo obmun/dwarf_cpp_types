@@ -4,6 +4,21 @@
 #include <string>
 #include <vector>
 
+namespace zoo
+{
+enum class OneEnum
+{
+    TEST,
+    BYE
+};
+
+class Other
+{
+    unsigned char foo;
+    OneEnum bar;
+};
+}
+
 struct Nested
 {
     float a[10];
@@ -21,6 +36,7 @@ struct TopStruct
     long unsigned int f;
     void *g;
     std::uint64_t h;
+    zoo::Other other;
 };
 
 void func()
