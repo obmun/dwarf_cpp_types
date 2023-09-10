@@ -1,4 +1,5 @@
 from collections import namedtuple
+from itertools import zip_longest
 
 import elftools.dwarf.constants as dc
 import logging
@@ -39,11 +40,13 @@ class Scope:
 class Namespace(Scope):
     """A scope that can only contain other struct definitions
 
-    (and other nested scoped through the `ScopeGraph`)
+    (and other nested scopes through the `ScopeGraph`)
     """
+    blacklisted: bool
 
     def __init__(self, name: str):
         super().__init__(name)
+        self._blacklisted = False
 
 
 class RootNs(Namespace):
@@ -51,27 +54,27 @@ class RootNs(Namespace):
         super().__init__('')
 
 
-class ScopeGraphNode:
+class ScopeTreeNode:
     """The node of a `ScopeGraph`
     """
-    _parent: 'ScopeGraphNode'
-    _children: list['ScopeGraphNode']
+    _parent: 'ScopeTreeNode'
+    _children: list['ScopeTreeNode']
     _depth: UInt
     scope: Scope
 
-    def __init__(self, scope: Scope, parent: t.Optional['ScopeGraphNode'], depth: UInt):
+    def __init__(self, scope: Scope, parent: t.Optional['ScopeTreeNode'], depth: UInt):
         self._depth = depth
         self.scope = scope
         self._children = []
         self._parent = parent
 
-    def add_child(self, scope: Scope) -> 'ScopeGraphNode':
-        """
+    def add_child(self, scope: Scope) -> 'ScopeTreeNode':
+        """Adds a new child scope
 
         :param scope:
         :return:
         """
-        new_child = ScopeGraphNode(scope, self, self._depth + 1)
+        new_child = ScopeTreeNode(scope, self, self._depth + 1)
         self._children.append(new_child)
         return new_child
 
@@ -81,35 +84,52 @@ class ScopeGraphNode:
 
     def get_path(self) -> list[str]:
         if not self._parent:
+            # I am the root NS. My path is the empty list
             return []
         return self._parent.get_path() + [self.scope.name]
 
+    def build_child_scope_path(self, scope: Scope) -> list[str]:
+        """Given a scope, builds the full path as if the namespace itself was a child of this scope-tree node
 
-class StructScopeGraphNode(ScopeGraphNode):
+        :return:
+        """
+        return self.get_path() + [scope.name]
+
+
+class StructScopeTreeNode(ScopeTreeNode):
+    """A scope-graph node where the scope is a struct (and not a namespace)
+
+    """
     scope: 'StructType'
 
 
-class ScopeGraph:
-    _root: ScopeGraphNode
+class ScopeTree:
+    """A type representing a tree of scopes
+
+    """
+    _root: ScopeTreeNode
 
     def __init__(self):
-        self._root = ScopeGraphNode(RootNs(), None, 0)
+        self._root = ScopeTreeNode(RootNs(), None, 0)
 
     @property
-    def root(self) -> ScopeGraphNode:
+    def root(self) -> ScopeTreeNode:
         return self._root
+
 
 # These "globals" should be moved to a class (together with all the associated code)
 
-scope_to_die_map: bidict['ScopeGraphNode', DIE] = bidict()
+scope_node_to_die_map: bidict['ScopeTreeNode', DIE] = bidict()
 die_to_type_map: bidict[DIE, 'TypeDef'] = bidict()
 # ^^ THIS IS FUCKED! I am holding the DIE instances in memory!!!
 # TODO: I need a unique ID for each DIE. Maybe the offset?????
-scope_graph = ScopeGraph()
+scope_graph = ScopeTree()
 
 
-class StructDefinition():
-    """A definition of a struct, containing various fields
+class StructDefinition:
+    """A definition of a struct, containing various fields (AKA members)
+
+    In this code, we are NOT interested in methods of the struct. Hence, they are ignored
     """
     fields: dict[str, 'TypeDef']
 
@@ -150,13 +170,15 @@ def extract_types(filename, types: t.Optional[list[str]] = None):
 
         dwarf_info = elf_file.get_dwarf_info()
 
-        for cu in dwarf_info.iter_CUs():
+        for cu_index, cu in enumerate(dwarf_info.iter_CUs()):
+            if cu_index > 0:
+                raise NotImplementedError("We do not support DWARF info containing multiple Compile Units")
+
             # Start with the top DIE, the root for this CU's DIE tree
             top_die = cu.get_top_DIE()
-            print('    Top DIE with tag=%s' % top_die.tag)
-            print('    name=%s' % Path(top_die.get_full_path()).as_posix())
+            logging.debug(f'Top DIE with tag={top_die.tag}, name={Path(top_die.get_full_path()).as_posix()}')
 
-            process_die_recursive(top_die, scope_graph.root)
+            maybe_recurse_scope_die(top_die, scope_graph.root)
 
     pass
 
@@ -183,6 +205,14 @@ class TypeDef:
         return self._cpp_decl
 
 
+class Void(TypeDef):
+    """The none type in C/C++
+    """
+
+    def __init__(self):
+        super().__init__('void')
+
+
 class PrimitiveType(TypeDef):
     value: t.Any
 
@@ -206,11 +236,18 @@ class Enumeration(TypeDef):
 
 class Reference(TypeDef):
     """A type definition that is a reference to another type definition
+
+    A C++ alias or a typedef are represented with this type
     """
     _dest: TypeDef
 
-    def __init__(self, dest: TypeDef):
-        super().__init__(dest.cpp_decl)
+    def __init__(self, name: str, dest: TypeDef):
+        """
+
+        :param name: We cannot use directly `dest.cpp_decl` as name, as the typedef has its own name (the name of the
+        alias to the original type) that we want to keep :param dest:
+        """
+        super().__init__(name)
         self._dest = dest
 
     @property
@@ -286,6 +323,7 @@ class SequenceContainer(Container):
 class Vector(SequenceContainer, StructType):
     """Type definition representing a std::vector
     """
+
     def __init__(self, name: str):
         StructType.__init__(self, name)
 
@@ -296,16 +334,72 @@ class Array(SequenceContainer):
     pass
 
 
-class SmartPtr(TypeDef):
-    _element_type: t.Any
+class GenericPointer(TypeDef):
+    """A type representing any pointer (C or C++ smart_ptr)
+
+    """
+    # We use the same nomenclature as the STL. Check the shared_ptr
+    _element_type: None | TypeDef
+
+    def __init__(self):
+        super().__init__("PTR...")
+        # ^^ FOR THE MOMENT. When setting the pointed type, we will correct this wrong name.
+        # TODO: should we add the concept that the "name" of the TypeDef instance might be unset?
+        self._element_type = None
+
+    @property
+    def element_type(self) -> TypeDef:
+        if not self._element_type:
+            raise RuntimeError('element_type MUST be set before trying to get it')
+        return self._element_type
+
+    @element_type.setter
+    def element_type(self, element_type: TypeDef):
+        self._element_type = element_type
+        self._cpp_decl = element_type.cpp_decl + '*'
+
+
+class CPointer(GenericPointer):
+    def __init__(self, *args):
+        """
+        We need the arbitrary arguments (non kw) because the generic struct processor expects a struct ctor that needs a name
+        TODO: revisit this design :(
+        """
+        super().__init__()
+
+    @GenericPointer.element_type.setter
+    def element_type(self, element_type: TypeDef):
+        self._element_type = element_type
+        self._cpp_decl = element_type.cpp_decl + '*'
+
+
+class SmartPtr(GenericPointer, StructType):
+    """A pointer that is an STL smart_ptr
+
+    We inherit from StructType because all C++ smart ptrs are also classes.
+    """
+    def __init__(self, name: str):
+        GenericPointer.__init__(self)
+        StructType.__init__(self, name)
 
 
 class UniquePtr(SmartPtr):
-    pass
+    def __init__(self, name: str):
+        super().__init__(name)
 
 
-class SharedPtr(TypeDef):
-    pass
+class SharedPtr(SmartPtr):
+    def __init__(self, name: str):
+        super().__init__(name)
+
+
+class String(StructType):
+    """Type corresponding to a std::string
+
+    """
+
+    def __init__(self, name: str):
+        super().__init__(name)
 
 
 def dwarf_base_type_to_py_type(die: DIE) -> PrimitiveType:
@@ -337,7 +431,7 @@ def dwarf_base_type_to_py_type(die: DIE) -> PrimitiveType:
                          die.attributes['DW_AT_name'].value.decode('utf-8'))
 
 
-def process_type_die(die: DIE, scope: t.Optional[ScopeGraphNode], dependency: bool = False) -> t.Optional[TypeDef]:
+def process_type_die(die: DIE, scope: t.Optional[ScopeTreeNode], dependency: bool = False) -> t.Optional[TypeDef]:
     """Processes a DIE that contains the declaration of a type
 
     This is a helper method. Feed it any of the DWARF type declarations DIEs, and it will take care of execute the right processing method.
@@ -362,11 +456,12 @@ def process_type_die(die: DIE, scope: t.Optional[ScopeGraphNode], dependency: bo
     match die.tag:
         case 'DW_TAG_base_type':
             ret = dwarf_base_type_to_py_type(die)
+
         case 'DW_TAG_pointer_type':
-            logging.error('cannot handle ptr types yet');
+            ret = process_c_pointer(die, scope)
 
         case 'DW_TAG_typedef':
-            process_typedef(die, scope)
+            ret = process_typedef(die, scope)
 
         case 'DW_TAG_array_type':
             # !!! Array DIEs normally have children!
@@ -383,10 +478,10 @@ def process_type_die(die: DIE, scope: t.Optional[ScopeGraphNode], dependency: bo
             ret = recurse_extracting_qualifiers(die, scope)
 
         case tag if tag in CLASS_OR_STRUCT_TYPE_TAGS:
-            struct_graph_node = process_struct_or_class_type(die, scope, dependency)
+            struct_graph_node = maybe_process_struct_or_class_type(die, scope, dependency)
             struct_type = struct_graph_node.scope
             ret = struct_type
-            #ret = Reference(struct_type)
+            # ret = Reference(struct_type)
             # TODO: why did I do this? The struct type def in Python is already a reference to the object ...
 
         case other:
@@ -396,14 +491,35 @@ def process_type_die(die: DIE, scope: t.Optional[ScopeGraphNode], dependency: bo
     return ret
 
 
-def process_typedef(die: DIE, scope: ScopeGraphNode):
+def process_c_pointer(die: DIE, scope: ScopeTreeNode) -> CPointer:
+    assert die.tag == 'DW_TAG_pointer_type'
+
+    # A C pointer DIE either:
+    # - Contains a DW_AT_type attr, for pointers pointer to a concrete type
+    # - Does NOT CONTAIN 'DW_AT_type' attr in case of void* pointer
+    if 'DW_AT_type' not in die.attributes:
+        # This is a void ptr
+        referenced_type = Void()
+    else:
+        referenced_type = process_type_attr(die, scope)
+
+    ret = CPointer()
+    ret.element_type = referenced_type
+    return ret
+
+
+def process_typedef(die: DIE, scope: ScopeTreeNode) -> Reference:
     assert die.tag == 'DW_TAG_typedef'
-    # A typedef DIE just has a 'DW_AT_type' attr that we need to process.
-    return process_type_attr(die, scope)
+    # A typedef DIE just has a 'DW_AT_type' attr that we need to process, referencing another typoe.
+    referenced_type = process_type_attr(die, scope)
+    # However, as we have a bidir map between DIEs and created types, the typedef must be created as well as its own
+    # "unique" type, and reference the real underyling type. Just exactly as DWARF does it
+    ret = Reference(die.attributes['DW_AT_name'].value.decode(), referenced_type)
+    return ret
 
 
-def process_type_ref(attr: AttributeValue, die: DIE, scope: ScopeGraphNode) -> t.Optional[TypeDef]:
-    """Recurses a type reference, reaching the underlying type definition and evaluating it
+def process_type_ref(attr: AttributeValue, die: DIE, scope: ScopeTreeNode) -> t.Optional[TypeDef]:
+    """Follows a type reference, reaching the underlying type definition and evaluating it
 
     :param attr: The DW_AT_type attr to process
     :param die: The DIE containing this attribute (needed because the attr does not keep reference to its holding DIE)
@@ -423,9 +539,9 @@ def process_type_ref(attr: AttributeValue, die: DIE, scope: ScopeGraphNode) -> t
     # New type. Process it
 
     parent_die = type_die.get_parent()
-    assert scope in scope_to_die_map
-    given_scope_die = scope_to_die_map[scope]
-    if given_scope_die != parent_die:
+    assert scope in scope_node_to_die_map
+    caller_provided_scope_die = scope_node_to_die_map[scope]
+    if caller_provided_scope_die != parent_die:
         # This is a reference to a type in a different scope.
         # 1) We need to parent the referenced type to its CORRECT scope
         # 2) It might be the case that we have NOT processed yet the parent scope
@@ -434,17 +550,27 @@ def process_type_ref(attr: AttributeValue, die: DIE, scope: ScopeGraphNode) -> t
             # If the real parent is just the CU, this is a non-namespaced type (root) or a base type
             # Just use the ROOT ns as parent
             scope = scope_graph.root
+
+            # DWARF notes:
+            # * When the compiler (at least GCC) creates DWARF info for C-pointer declarations, these are sometimes directly parented to the CU
+            #   - It seems that these basic declarations are NOT parented  inside the containing struct whose member uses this basic pointer type
+            #     Probably for dedup?
+            #   - E.g.: for a member of a struct of type `int16 *ptr;` this has been the case.
         else:
-            if parent_die not in scope_to_die_map.inverse:
+            if parent_die not in scope_node_to_die_map.inverse:
                 # Not processed before! Time to do it now!
+
+                # ADD a filter to blackslit:
+                # 1. Types that start with __
+                # 2. std:: types by default, except certain accepted types (the ones from the stl_processors)
                 raise NotImplementedError()
             else:
-                scope = scope_to_die_map.inverse[parent_die]
+                scope = scope_node_to_die_map.inverse[parent_die]
 
     return process_type_die(type_die, scope, True)
 
 
-def process_type_attr(die: DIE, scope: ScopeGraphNode):
+def process_type_attr(die: DIE, scope: ScopeTreeNode):
     """Process the attribute that defines the type of this Debug Info Entry
 
     :param die:
@@ -459,7 +585,7 @@ def process_type_attr(die: DIE, scope: ScopeGraphNode):
             raise RuntimeError('Do not know now how to handle type attr of form {}'.format(type_attr.form))
 
 
-def process_member_die(die: DIE, parent_struct_node: StructScopeGraphNode) -> None:
+def process_member_die(die: DIE, parent_struct_node: StructScopeTreeNode) -> None:
     """Processes a tag==member child DIE to add the member description to the parent struct
 
     :param die:
@@ -479,14 +605,13 @@ def process_member_die(die: DIE, parent_struct_node: StructScopeGraphNode) -> No
             "Could not process type for member '{}::{}'. Definition will be incomplete".format(parent_struct_type.name,
                                                                                                field_name))
 
-    print(indent + 'DIE tag=%s, attrs=' % die.tag)
     attr_indent = indent + BASIC_INDENT
 
     assert field_name not in parent_struct_def.fields
     parent_struct_def.fields[field_name] = type_def
 
 
-def recurse_extracting_qualifiers(die: DIE, scope_node: ScopeGraphNode) -> None | QualifiedType:
+def recurse_extracting_qualifiers(die: DIE, scope_node: ScopeTreeNode) -> None | QualifiedType:
     tag_to_qualifier_type = {
         'DW_TAG_const_type': Const
     }
@@ -502,7 +627,7 @@ def recurse_extracting_qualifiers(die: DIE, scope_node: ScopeGraphNode) -> None 
     return qualified_type
 
 
-def process_enum_type(die: DIE, scope_node: ScopeGraphNode, dependency: bool = False) -> None | Enumeration:
+def process_enum_type(die: DIE, scope_node: ScopeTreeNode, dependency: bool = False) -> None | Enumeration:
     """
 
     :param die: The DIE containing the enum type definition. This type DIE must NOT have been processed before
@@ -521,8 +646,20 @@ def process_enum_type(die: DIE, scope_node: ScopeGraphNode, dependency: bool = F
     return Enumeration(name)
 
 
+def array_matcher(type_name: str) -> bool:
+    return type_name.startswith('array<')
+
+
+def string_matcher(type_name: str) -> bool:
+    return type_name.startswith('basic_string<')
+
+
+def unique_ptr_matcher(type_name: str) -> bool:
+    return type_name.startswith('unique_ptr<')
+
+
 def vector_matcher(type_name: str) -> bool:
-    return type_name.startswith('vector')
+    return type_name.startswith('vector<')
 
 
 def get_name(die: DIE, none_val: None | str = None) -> None | str:
@@ -547,7 +684,7 @@ def print_siblings(die: DIE) -> None:
         print(f"Sibling tag={sibling_die.tag},name={name}")
 
 
-def get_child(die: DIE, tag: str, name: str) -> None|DIE:
+def get_child(die: DIE, tag: str, name: str) -> None | DIE:
     """Retrieves a child of the given tag and with the given name
 
     :return:
@@ -566,30 +703,64 @@ def get_child(die: DIE, tag: str, name: str) -> None|DIE:
     return matching_die
 
 
-def vector_processor(vector: Vector, die: DIE, parent_struct_node: StructScopeGraphNode) -> None:
-    """
+STLProcessorResult = namedtuple('STLProcessorResult', 'process_members')
 
-    :param vector: The vector type instance we are populating
-    :param die: The DIE containing the definition of this vector
-    :param parent_struct_node: The parent scope containing this vector declaration
+
+def array_or_vector_processor(type_instance: Array | Vector, die: DIE,
+                              struct_node: StructScopeTreeNode) -> STLProcessorResult:
+    """Processes a DIE that contains the definition of a std::array or a std::vector insance
+
+    :param type_instance: The array/vector type instance we are populating
+    :param die: The DIE containing the definition of this array
+    :param struct_node: This array/vector type as a scope, as the vector is itself a struct/class and hence the scope containing all its members
     """
     value_type_typedef_child_die = get_child(die, 'DW_TAG_typedef', 'value_type')
-    value_type = process_typedef(value_type_typedef_child_die, parent_struct_node)
-    vector.value_type = value_type
+    value_type = process_typedef(value_type_typedef_child_die, struct_node)
+    type_instance.value_type = value_type
+    # For the moment, stop further processing of this type
+    return STLProcessorResult(process_members=False)
 
 
-STLClassEntry = namedtuple('STLClassEntry', 'type_class processor')
+# TODO: dedup this function!! IT IS THE SAME ONE as for the VECTOR!
+def array_processor(array: Array, die: DIE, array_struct_node: StructScopeTreeNode) -> STLProcessorResult:
+    return array_or_vector_processor(array, die, array_struct_node)
+
+
+def string_processor(string: String, die: DIE, struct_node: StructScopeTreeNode) -> STLProcessorResult:
+    logging.error("Not yet implemented")
+    return STLProcessorResult(process_members=False)
+
+
+def unique_ptr_processor(unique_ptr: UniquePtr, die: DIE, struct_node: StructScopeTreeNode) -> STLProcessorResult:
+    logging.error("Not yet implemented")
+    return STLProcessorResult(process_members=False)
+
+
+def vector_processor(vector: Vector, die: DIE, vector_struct_node: StructScopeTreeNode) -> STLProcessorResult:
+    return array_or_vector_processor(vector, die, vector_struct_node)
+
+
+STLClassProcessorsEntry = namedtuple('STLClassProcessorsEntry', 'type_class processor')
 # A list containing the processors for special STL struct/class types
-stl_classes = [
-    (vector_matcher, STLClassEntry(Vector, vector_processor))
+stl_class_processors = [
+    (array_matcher, STLClassProcessorsEntry(Array, array_processor)),
+    (string_matcher, STLClassProcessorsEntry(String, string_processor)),
+    (unique_ptr_matcher, STLClassProcessorsEntry(UniquePtr, unique_ptr_processor)),
+    (vector_matcher, STLClassProcessorsEntry(Vector, vector_processor))
 ]
 
 
-def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode,
-                                 dependency: bool = False) -> None | ScopeGraphNode:
-    """Processes a DIE that is a (tag) structure_type or class_type
+def maybe_process_struct_or_class_type(die: DIE, scope_node: ScopeTreeNode,
+                                       dependency: bool = False) -> None | ScopeTreeNode:
+    """Processes a DIE that is a (tag) structure_type or class_type and its child members.
 
-    A struct or class declaration CANNOT be processed twice. Make sure to detect this situation outside this function
+    Processes as well all its child 'member' DIEs, recursively. Any other type of DIEs are ignored, as they are not
+    relevant for the struct/class definition.
+
+    A struct or class declaration CANNOT be processed twice. Make sure to detect this situation outside this function.
+
+    It applies the struct whitelist. If the DIE contains a struct that has not been explicitly whitelisted and
+    is NOT marked as dependency of a parent type (`dependency` param)
 
     :param die:
     :param scope_node:
@@ -606,7 +777,7 @@ def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode,
     indent = BASIC_INDENT * scope_node.depth
 
     if 'DW_AT_name' not in die.attributes:
-        logging.info("Ignoring unnamed DIE @{}".format(die.offset))
+        logging.warning("Ignoring unnamed struct/class DIE @{}".format(die.offset))
         return
     name = die.attributes['DW_AT_name'].value.decode("utf-8")
 
@@ -619,75 +790,175 @@ def process_struct_or_class_type(die: DIE, scope_node: ScopeGraphNode,
 
         struct_type = type_cls(name)
         struct_type_node = scope_node.add_child(struct_type)
-        assert struct_type_node not in scope_to_die_map
-        scope_to_die_map[struct_type_node] = die
+        assert struct_type_node not in scope_node_to_die_map
+        scope_node_to_die_map[struct_type_node] = die
 
         return struct_type, struct_type_node
-
 
     # The STL types are also structs (classes). We need to apply a matcher on the name to do additional type-specific
     # processing
     struct_type = struct_type_node = None
-    for matcher, (type_cls, processor) in stl_classes:
-        if matcher(name):
-            struct_type, struct_type_node = generic_struct_processing(type_cls)
-            processor(struct_type, die, struct_type_node)
-            break
-    else:
-        logging.warning(f"Could not find an STL-processor for {name}. Doing generic struct processing only")
+    with_dedicated_processor = False
+    process_members = True
+    if full_path[0] == 'std':
+        for matcher, (type_cls, processor) in stl_class_processors:
+            if matcher(name):
+                with_dedicated_processor = True
+                struct_type, struct_type_node = generic_struct_processing(type_cls)
+                result = processor(struct_type, die, struct_type_node)
+                process_members = result.process_members
+                break
+        else:
+            logging.debug(f"Could not find an STL-processor for {name}. Doing generic struct processing only")
+    if not with_dedicated_processor:
         # Do just the basic processing
         struct_type, struct_type_node = generic_struct_processing(StructType)
 
     # The member fields of a struct are provided as child DIEs
-    for child_die in die.iter_children():
-        if child_die.tag == 'DW_TAG_member':
-            process_member_die(child_die, struct_type_node)
+    if process_members:
+        for child_die in die.iter_children():
+            if child_die.tag == 'DW_TAG_member':
+                process_member_die(child_die, struct_type_node)
 
     scope_node.scope.structs[name] = struct_type
 
     return struct_type_node
 
 
-def process_die_recursive(die, scope: ScopeGraphNode):
-    """
+def maybe_recurse_scope_die(die, scope: ScopeTreeNode):
+    """Processes and recurses a DIE that represents a scope (namespace, struct or CU)
+
+    Applies namespace blacklist rules
+
+    :param scope: The parent scope where the nested scopes or discovered entries will be placed
     """
     curr_scope_full_path = scope.get_path()
 
     indent = BASIC_INDENT * scope.depth
-    print(indent + 'DIE tag=%s, attrs=' % die.tag)
 
     name = die.attributes.get('DW_AT_name', None)
     if name:
         name = name.value.decode('utf-8')
 
-    ns_name = None
+    recurse = True
     match die.tag:
+        case 'DW_TAG_compile_unit':
+            # Register the CU DIE to the root scope
+            scope_node_to_die_map[scope_graph.root] = die
+
         case 'DW_TAG_namespace':
             assert len(curr_scope_full_path) == scope.depth
+            assert name
 
-            ns_name = name
-            new_ns = Namespace(ns_name)
+            new_ns = Namespace(name)
+            if is_ns_blacklisted(scope.build_child_scope_path(new_ns)):
+                # We will NOT process the children (types or nested NSs) of this scope. But we will still add it to the graph, as blacklisted
+                new_ns.blacklisted = True
+                recurse = False
             scope = scope.add_child(new_ns)
-            assert scope not in scope_to_die_map
-            scope_to_die_map[scope] = die
+            assert scope not in scope_node_to_die_map
+            scope_node_to_die_map[scope] = die
 
         case t if t in CLASS_OR_STRUCT_TYPE_TAGS:
-            process_struct_or_class_type(die, scope)
+            maybe_process_struct_or_class_type(die, scope)
             # for name, val in die.attributes.items():
             #     print(indent_level + '  %s = %s' % (name, val))
 
         case other:
-            logging.debug("Ignoring DIE '{}' of type '{}'".format(name, die.tag))
-            pass
+            logging.info("Ignoring DIE '{}' of unhandled type '{}'".format(name if name else "UNNAMED", die.tag))
+            recurse = False
 
-    for child in die.iter_children():
-        process_die_recursive(child, scope)
+    if recurse:
+        for child in die.iter_children():
+            # Let's continue recursing non-member DIEs (e.g. other nested namespaces)
+            maybe_recurse_scope_die(child, scope)
+
+
+def is_namespace_glob_expression(val: list[str]) -> bool:
+    if not len(val):
+        raise ValueError("val cannot be an empty list")
+
+    start_pos = 0
+    try:
+        star_pos = val.index('*')
+    except ValueError as e:
+        # Namespace path does not contain *. It is not a NS glob expression
+        return False
+    if star_pos != len(val) - 1:
+        raise ValueError('Malformed glob expression')
+
+
+def namespace_matches_glob_expression(ns: list[str], ns_glob_expr: list[str]) -> bool:
+    assert is_namespace_glob_expression(ns_glob_expr)
+    for ns_elem, expr_elem in zip_longest(ns, ns_glob_expr):
+        if ns_elem is None:
+            if expr_elem == '*':
+                # ns finished, but at the same point as the * operator is found in the glob_expr. E.g.:
+                # - ns == ['Foo', 'Bar']
+                # - expr: == [ 'Foo', 'Bar', '*']
+                # The expr is considered as including ALL elements inside Foo::Bar. I.e., the full Foo::Bar.
+                # Hence, this is a match
+                return True
+            else:
+                # Given NS is more general than the glob expr. The glob expr specifies a "deeper" scope, and hence does
+                # not apply to this one
+                return False
+        elif expr_elem is None:
+            # We cannot reach this point :D. This is covered by the elif below
+            assert False
+            # The given NS is inside (child) the one in the glob expr
+            # As ATM we only support the '*' operator, this is fundamentally a match
+            # assert ns_glob_expr[-1] == '*'
+            # return True
+        elif expr_elem == '*':
+            # We reached the end of the glob expression. So far we matched the parent NSs => match
+            return True
+        elif ns_elem != expr_elem:
+            return False
+
+    # We cannot reach this point
+    assert False
+
+
+def match_gnu_namespaces() -> bool:
+    """Filters out __gnu_debug, __gnu_cxx, ... and others
+
+    :return:
+    """
+    return False
 
 
 types_whitelist: list[list[str]]
+# The blacklist can be either:
+# * a complete namespace path (sequence of namespaces to fully select a _concrete_ leaf namespace) or
+#   Only the namespace direct children are considered. Child namespaces are still evaluated
+# * a Simple Namespace Glob Expression (SNGE (TM)).
+#   A namespace path + the "include all children" '*' operator, indicating that all the contents of the scope should be avoided
+# * a predicate to be applied to a scope node that returns whether the node is blacklisted (return True) or not (False)
+namespaces_blacklist = [
+    ['std', '*'],  # By default, unless a dependency, do not include any std:: content
+    # gnu_namespaces_matcher,
+]
+
+
+def is_ns_blacklisted(ns: list[str]) -> bool:
+    for blacklist_entry in namespaces_blacklist:
+        match = False
+        if is_namespace_glob_expression(blacklist_entry):
+            match = namespace_matches_glob_expression(ns, blacklist_entry)
+        elif callable(blacklist_entry):
+            raise NotImplementedError('NS blacklist predicates still not implemented')
+        else:
+            match = ns == blacklist_entry
+        if match:
+            return True
+    return False
+
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
+    FORMAT = "%(levelname)s:%(name)s:%(funcName)s - %(message)s"
+    logging.basicConfig(format=FORMAT, level=logging.DEBUG)
 
     if len(sys.argv) < 2:
         print('Expected usage: {0} <executable>'.format(sys.argv[0]))
@@ -696,5 +967,6 @@ if __name__ == '__main__':
     # Associated types will be automatically brought in
     types_whitelist = [
         ['TopStruct'],
+        # Example syntax: ['root_namespace', 'nested_ns', 'Type']
     ]
     extract_types(sys.argv[1])

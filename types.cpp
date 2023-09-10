@@ -36,7 +36,8 @@ struct TopStruct
     long unsigned int f;
     void *g;
     std::uint64_t h;
-    zoo::Other other;
+    zoo::Other other; // Is the order maintained in member children of struct DIE? Or must one check offset attrs?
+    std::int16_t *int_ptr;
 };
 
 void func()
