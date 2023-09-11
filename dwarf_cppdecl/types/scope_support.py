@@ -64,14 +64,20 @@ def match_gnu_namespaces() -> bool:
     return False
 
 
-namespaces_blacklist = [
+# The blacklist can be either:
+# * a complete namespace path (sequence of namespaces to fully select a _concrete_ leaf namespace) or
+#   Only the namespace direct children are considered. Child namespaces are still evaluated
+# * a Simple Namespace Glob Expression (SNGE (TM)).
+#   A namespace path + the "include all children" '*' operator, indicating that all the contents of the scope should be avoided
+# * a predicate to be applied to a scope node that returns whether the node is blacklisted (return True) or not (False)
+_NAMESPACES_BLACKLIST = [
     ['std', '*'],  # By default, unless a dependency, do not include any std:: content
     # gnu_namespaces_matcher,
 ]
 
 
 def is_ns_blacklisted(ns: list[str]) -> bool:
-    for blacklist_entry in namespaces_blacklist:
+    for blacklist_entry in _NAMESPACES_BLACKLIST:
         match = False
         if is_namespace_glob_expression(blacklist_entry):
             match = namespace_matches_glob_expression(ns, blacklist_entry)
