@@ -70,6 +70,10 @@ class ScopeTreeNode:
         return new_child
 
     @property
+    def children(self) -> list['ScopeTreeNode']:
+        return self._children
+
+    @property
     def depth(self) -> UInt:
         return self._depth
 
@@ -82,6 +86,7 @@ class ScopeTreeNode:
             # I am the root NS. My path is the empty list
             return []
         return self._parent.get_path() + [self.scope.name]
+        # TODO: if we have here a vector (which is underneath a struct), we have a _PROBLEM_
 
     def build_child_scope_path(self, scope: Scope) -> list[str]:
         """Given a scope, builds the full path as if the namespace itself was a child of this scope-tree node
@@ -105,6 +110,7 @@ class ScopeTree:
     """A type representing a tree of scopes
 
     """
+    _SCOPE_SEPARATOR = "::"
     _root: ScopeTreeNode
 
     def __init__(self):
@@ -113,6 +119,25 @@ class ScopeTree:
     @property
     def root(self) -> ScopeTreeNode:
         return self._root
+
+    @classmethod
+    def _depth_first_visit(cls, node: ScopeTreeNode, struct_visitor):
+        for child in node.children:
+            ScopeTree._depth_first_visit(child, struct_visitor)
+        scope_path = cls._SCOPE_SEPARATOR.join(node.get_path())
+        for name, s in node.scope.structs.items():
+            struct_visitor(scope_path, name, s)
+
+    def flatten(self):
+        ret = {}
+
+        def add_structs_to_dict(scope_path: str, name: str, s: StructType):
+            nonlocal ret
+            ret[self._SCOPE_SEPARATOR.join((scope_path, name))] = s
+
+        self._depth_first_visit(self.root, add_structs_to_dict)
+        return ret
+
 
 
 # We are using a forward declaration of this class. In order to avoid the circular import, just move the full

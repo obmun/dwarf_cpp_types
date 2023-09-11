@@ -19,4 +19,5 @@ if __name__ == '__main__':
     ]
     extractor = TypesExtractor()
     extractor.process(sys.argv[1], types_whitelist)
+    structs = extractor.scope_tree.flatten()
     pass

@@ -27,13 +27,13 @@ class TypesExtractor:
     _die_to_type_map: bidict[DIE, 'TypeDef']
     # ^^ THIS IS FUCKED! I am holding the DIE instances in memory!!!
     # TODO: I need a unique ID for each DIE. Maybe the offset?
-    _scope_graph: ScopeTree
+    _scope_tree: ScopeTree
     types_whitelist: list[list[str]]
 
     def __init__(self):
         self._scope_node_to_die_map = bidict()
         self._die_to_type_map = bidict()
-        self._scope_graph = ScopeTree()
+        self._scope_tree = ScopeTree()
         self.types_whitelist = None
 
     def process(self, filename, types: t.Optional[list[str]] = None):
@@ -62,9 +62,13 @@ class TypesExtractor:
                 top_die = cu.get_top_DIE()
                 logging.debug(f'Top DIE with tag={top_die.tag}, name={Path(top_die.get_full_path()).as_posix()}')
 
-                self._maybe_recurse_scope_die(top_die, self._scope_graph.root)
+                self._maybe_recurse_scope_die(top_die, self._scope_tree.root)
 
         self.types_whitelist
+
+    @property
+    def scope_tree(self):
+        return self._scope_tree
 
     @staticmethod
     def _dwarf_base_type_to_py_type(die: DIE) -> PrimitiveType:
@@ -96,14 +100,13 @@ class TypesExtractor:
             MAPPING[(die.attributes["DW_AT_encoding"].value, die.attributes['DW_AT_byte_size'].value)],
             die.attributes['DW_AT_name'].value.decode('utf-8'))
 
-    def _process_type_die(self, die: DIE, scope: t.Optional[ScopeTreeNode], dependency: bool = False) -> t.Optional[
-        TypeDef]:
+    def _process_type_die(self, die: DIE, scope_node: t.Optional[ScopeTreeNode], dependency: bool = False) -> t.Optional[TypeDef]:
         """Processes a DIE that contains the declaration of a type
 
         This is a helper method. Feed it any of the DWARF type declarations DIEs, and it will take care of execute the right processing method.
 
         :param die: The DIE to process
-        :param scope: If None, we will use the PARENT die to find the right SCOPE. Otherwise, the scope that will be the parent of the new type instance
+        :param scope_node: If None, we will use the PARENT die to find the right SCOPE. Otherwise, the scope that will be the parent of the new type instance
 
         :param dependency: Indicates whether this type is a dependency of other type (e.g., the type of a member of a
         struct). If True, this type will be imported even if it is not in the whitelist, as some type in its dependees
@@ -113,40 +116,48 @@ class TypesExtractor:
         be interpreted.
         """
         parent_die = None
-        if not scope:
+        if not scope_node:
             parent_die = die.get_parent()
 
         # TODO: here we will always be doing FIRST TIME processing of a type, right? We are processing the DIE type ...
         # How are we gonna handle references to existing types? ATM we only handle Refs to structs... But I guess we will have refs to EVERYTHING
 
         ret = None
+        add_type_def_to_scope = False
         match die.tag:
             case 'DW_TAG_base_type':
                 ret = self._dwarf_base_type_to_py_type(die)
 
             case 'DW_TAG_pointer_type':
-                ret = self._process_c_pointer(die, scope)
+                ret = self._process_c_pointer(die, scope_node)
 
             case 'DW_TAG_typedef':
-                ret = self._process_typedef(die, scope)
+                #add_type_def_to_scope = True
+                # TODO: this can be generalized.
+                # Option 1: add a property to the type definition:
+                #     if hasattr(type_def, `name`):
+                #         scope.add_named_type_def()
+                # Option 2 (better): make the TypeDef have both `name` and `def` properties :)
+                ret = self._process_typedef(die, scope_node)
 
             case 'DW_TAG_array_type':
-                # !!! Array DIEs normally have children!
-                # raise NotImplementedError("No array support ...")
+                # !Array DIEs normally have children!
+                #raise NotImplementedError("No array support ...")
                 pass
 
             case 'DW_TAG_enumeration_type':
-                ret = self._process_enum_type(die, scope, dependency)
+                ret = self._process_enum_type(die, scope_node, dependency)
 
             case tag if tag in self._QUALIFIER_TAGS:
                 # A type qualifier is a DIE with a relevant tag and a DW_AT_type attr of "ref" form
                 # E.g.:
                 # - const: DIE with tag==const_type with DW_AT_type-attribute of form==reference
-                ret = self._recurse_extracting_qualifiers(die, scope)
+                ret = self._recurse_extracting_qualifiers(die, scope_node)
 
             case tag if tag in self._CLASS_OR_STRUCT_TYPE_TAGS:
-                struct_graph_node = self._maybe_process_struct_or_class_type(die, scope, dependency)
-                struct_type = struct_graph_node.scope
+                add_type_def_to_scope = True
+                struct_type, struct_graph_node = (self._maybe_process_struct_or_class_type(die, scope_node, dependency)
+                                                  or (None, None))
                 ret = struct_type
                 # ret = Reference(struct_type)
                 # TODO: why did I do this? The struct type def in Python is already a reference to the object ...
@@ -157,6 +168,8 @@ class TypesExtractor:
 
         if ret:
             self._die_to_type_map[die] = ret
+            if add_type_def_to_scope:
+                scope_node.scope.structs[struct_type.cpp_decl] = struct_type
         return ret
 
     def _process_c_pointer(self, die: DIE, scope: ScopeTreeNode) -> CPointer:
@@ -215,7 +228,7 @@ class TypesExtractor:
             if parent_die.tag == 'DW_TAG_compile_unit':
                 # If the real parent is just the CU, this is a non-namespaced type (root) or a base type
                 # Just use the ROOT ns as parent
-                scope = self._scope_graph.root
+                scope = self._scope_tree.root
 
                 # DWARF notes:
                 # * When the compiler (at least GCC) creates DWARF info for C-pointer declarations, these are sometimes directly parented to the CU
@@ -259,7 +272,7 @@ class TypesExtractor:
         assert die.tag == 'DW_TAG_member'
 
         parent_struct_type = parent_struct_node.scope
-        parent_struct_def = parent_struct_type.definition
+        parent_struct_def = parent_struct_type.declaration
         indent = self._BASIC_INDENT * parent_struct_node.depth
 
         field_name = die.attributes['DW_AT_name'].value.decode('utf-8')
@@ -368,16 +381,25 @@ class TypesExtractor:
     ]
 
     def _maybe_process_struct_or_class_type(self, die: DIE, scope_node: ScopeTreeNode,
-                                            dependency: bool = False) -> None | ScopeTreeNode:
+                                            dependency: bool = False) -> None | tuple[StructType, ScopeTreeNode]:
         """Processes a DIE that is a (tag) structure_type or class_type and its child members.
 
-        Processes as well all its child 'member' DIEs, recursively. Any other type of DIEs are ignored, as they are not
-        relevant for the struct/class definition.
+        A complete definition of the struct is created. I.e., it processes as well all its child 'member' DIEs,
+        recursively. Any other type of children DIEs are ignored, as they are not relevant for the struct/class
+        definition.
 
-        A struct or class declaration CANNOT be processed twice. Make sure to detect this situation outside this function.
+        A struct or class declaration CANNOT be processed twice. Make sure to detect this situation outside this
+        function.
 
         It applies the struct whitelist. If the DIE contains a struct that has not been explicitly whitelisted and
         is NOT marked as dependency of a parent type (`dependency` param)
+
+        This method takes care of modifying the scope tree, adding the new scope that the new structure creates to
+        the tree.
+
+        .. important::
+           This method does NOT add the struct type definition to its scope. It ONLY modifies the scope tree.
+           The reason is that ALL type definitions go through the `_process_type_die()` method.
 
         :param die:
         :param scope_node:
@@ -386,11 +408,11 @@ class TypesExtractor:
         struct). If True, this type will be imported even if it is not in the whitelist, as some type in its dependees
         have been whitelisted.
 
-        :return: The scope graph node that corresponds to this new structure or class.
+        :return: None or the struct type def and the scope tree node that corresponds to this new structure or class
+        in the scope tree
         """
 
         assert die.tag in self._CLASS_OR_STRUCT_TYPE_TAGS
-        indent = self._BASIC_INDENT * scope_node.depth
 
         if 'DW_AT_name' not in die.attributes:
             logging.warning("Ignoring unnamed struct/class DIE @{}".format(die.offset))
@@ -438,9 +460,7 @@ class TypesExtractor:
                 if child_die.tag == 'DW_TAG_member':
                     self._process_member_die(child_die, struct_type_node)
 
-        scope_node.scope.structs[name] = struct_type
-
-        return struct_type_node
+        return struct_type, struct_type_node
 
     def _maybe_recurse_scope_die(self, die, scope: ScopeTreeNode):
         """Processes and recurses a DIE that represents a scope (namespace, struct or CU)
@@ -461,7 +481,7 @@ class TypesExtractor:
         match die.tag:
             case 'DW_TAG_compile_unit':
                 # Register the CU DIE to the root scope
-                self._scope_node_to_die_map[self._scope_graph.root] = die
+                self._scope_node_to_die_map[self._scope_tree.root] = die
 
             case 'DW_TAG_namespace':
                 assert len(curr_scope_full_path) == scope.depth
@@ -477,7 +497,8 @@ class TypesExtractor:
                 self._scope_node_to_die_map[scope] = die
 
             case t if t in self._CLASS_OR_STRUCT_TYPE_TAGS:
-                self._maybe_process_struct_or_class_type(die, scope)
+                # We call _maybe_process_struct_or_class_type always THRU the _process_type_die main entry point
+                self._process_type_die(die, scope)
                 # The struct_or_class processor already recurses needed members
                 recurse = False
 

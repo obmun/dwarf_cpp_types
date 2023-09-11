@@ -17,22 +17,49 @@ class Container(TypeDef):
         self._value_type = value
 
 
-class SequenceContainer(Container):
+class SequenceSize:
+    @property
+    def value(self) -> int:
+        pass
+
+
+class ConstantSize(SequenceSize):
     pass
+
+
+class FixedVarSize(SequenceSize):
+    @property
+    def min(self) -> None|int:
+        pass
+
+    @property
+    def max(self) -> None|int:
+        pass
+
+
+class DynamicSize(SequenceSize):
+    pass
+
+
+class SequenceContainer(Container):
+    # TODO: should we make this type inherit from a more general "sequence" type? The normal array is like this ALSO!
+    @property
+    def size(self) -> SequenceSize:
+        pass
 
 
 class Vector(SequenceContainer, StructType):
     """Type definition representing a std::vector
     """
-
     def __init__(self, name: str):
         StructType.__init__(self, name)
 
 
-class Array(SequenceContainer):
+class Array(SequenceContainer, StructType):
     """Type definition representing a std::array
     """
-    pass
+    def __init__(self, name: str):
+        StructType.__init__(self, name)
 
 
 class SmartPtr(GenericPointer, StructType):

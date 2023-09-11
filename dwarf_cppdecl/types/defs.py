@@ -19,7 +19,7 @@ class Const(Qualifier):
 
 
 class TypeDef:
-    """Base class for any type definition
+    """Base class for any type definition in C++
     """
     _cpp_decl: str
 
@@ -30,6 +30,21 @@ class TypeDef:
     def cpp_decl(self) -> str:
         return self._cpp_decl
 
+
+# In C++, "type definitions" might be NAMED or UNNAMED.
+# Example of (possibly) NAMED type definitions:
+# * struct, classes
+# * enums and class enums
+# * type aliases (`using` keyword)
+# * All the STL templates
+# Example of UNNAMED type definitions:
+# * A primitive type, that is ASSIGNED directly to an element (a member attribute, a variable)
+# * A C pointer, directly assigned as type of an identifier
+# * A C array, identical to a C pointer
+# ATM we are mixing in this type hierarchy the concepts of cpp_decl and name. This is WRONG.
+# TODO: decide on a proper design for this
+# NOTE: after a bit of thought, the best solution is obvious: add a name and a cpp_decl
+#    Q: are they mutually exclusive?
 
 class Void(TypeDef):
     """The none type in C/C++
@@ -104,8 +119,8 @@ class CompoundType(TypeDef):
     pass
 
 
-class StructDefinition:
-    """A definition of a struct, containing various fields (AKA members)
+class StructDeclaration:
+    """A declaration of a struct, containing various fields (AKA members)
 
     In this code, we are NOT interested in methods of the struct. Hence, they are ignored
     """
@@ -118,30 +133,32 @@ class StructDefinition:
 class StructType(CompoundType, Scope):
     """A class or struct type in C++
 
-    Note that a `StructDefinition` is also a `Scope`. It can then also contain other "scopes". The nested scopes are
+    Note that a `StructType` is also a `Scope`. It can then also contain other "scopes". The nested scopes are
     handled through the "scope" graph.
     """
 
-    _definition: StructDefinition
+    _declaration: StructDeclaration
 
     def __init__(self, name: str):
         """
-        A struct type does NOT have a "cpp_decl". It's declaration is just simply the C++ struct declaration syntax
+        .. todo::
+           A struct type does NOT have a "cpp_decl". Re-evaluate this `name` mixup garbage. Structs in C++
+           have a name (or not), but the full decl is the `StructDefinition` that we include as a member.
 
         :param name: The scope name
         """
-        CompoundType.__init__(self, f'struct {name}')
+        CompoundType.__init__(self, name)
         # ^^^ TODO: add the ClassType, and replace this hardcoded struct with class keyword
         Scope.__init__(self, name)
-        self._definition = StructDefinition()
+        self._declaration = StructDeclaration()
 
     @property
-    def definition(self) -> StructDefinition:
-        return self._definition
+    def declaration(self) -> StructDeclaration:
+        return self._declaration
 
-    @definition.setter
-    def definition(self, defi: StructDefinition) -> None:
-        self._definition = defi
+    @declaration.setter
+    def declaration(self, decl: StructDeclaration) -> None:
+        self._declaration = decl
 
 
 class GenericPointer(TypeDef):
