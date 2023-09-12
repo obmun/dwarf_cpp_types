@@ -74,7 +74,7 @@ class TypesExtractor:
     def _dwarf_base_type_to_py_type(die: DIE) -> PrimitiveType:
         assert die.tag == 'DW_TAG_base_type'
 
-        MAPPING: t.Final[dict] = {
+        MAPPING: t.Final[dict[tuple[int,int], np.generic]] = {
             (dc.DW_ATE_boolean, 1): np.bool_,
             (dc.DW_ATE_unsigned_char, 1): np.ubyte,  # According to NumPy doc (https://numpy.org/doc/stable/user/basics
             # .types.html), ubyte is equivalent to unsigned char. Review if this is the correct assignment
@@ -98,7 +98,7 @@ class TypesExtractor:
 
         return PrimitiveType(
             MAPPING[(die.attributes["DW_AT_encoding"].value, die.attributes['DW_AT_byte_size'].value)],
-            die.attributes['DW_AT_name'].value.decode('utf-8'))
+        )
 
     def _process_type_die(self, die: DIE, scope_node: t.Optional[ScopeTreeNode], dependency: bool = False) -> t.Optional[TypeDef]:
         """Processes a DIE that contains the declaration of a type
@@ -169,7 +169,7 @@ class TypesExtractor:
         if ret:
             self._die_to_type_map[die] = ret
             if add_type_def_to_scope:
-                scope_node.scope.structs[struct_type.cpp_decl] = struct_type
+                scope_node.scope.structs[struct_type.name] = struct_type
         return ret
 
     def _process_c_pointer(self, die: DIE, scope: ScopeTreeNode) -> CPointer:
@@ -188,13 +188,14 @@ class TypesExtractor:
         ret.element_type = referenced_type
         return ret
 
-    def _process_typedef(self, die: DIE, scope: ScopeTreeNode) -> Reference:
+    def _process_typedef(self, die: DIE, scope: ScopeTreeNode) -> TypeReference:
         assert die.tag == 'DW_TAG_typedef'
         # A typedef DIE just has a 'DW_AT_type' attr that we need to process, referencing another typoe.
         referenced_type = self._process_type_attr(die, scope)
         # However, as we have a bidir map between DIEs and created types, the typedef must be created as well as its own
         # "unique" type, and reference the real underyling type. Just exactly as DWARF does it
-        ret = Reference(die.attributes['DW_AT_name'].value.decode(), referenced_type)
+        ret = TypeReference(die.attributes['DW_AT_name'].value.decode(), referenced_type)
+        ret.ref_type = TypeReference.RefType.TYPEDEF
         return ret
 
     def _process_type_ref(self, attr: AttributeValue, die: DIE, scope: ScopeTreeNode) -> t.Optional[TypeDef]:
@@ -272,7 +273,7 @@ class TypesExtractor:
         assert die.tag == 'DW_TAG_member'
 
         parent_struct_type = parent_struct_node.scope
-        parent_struct_def = parent_struct_type.declaration
+        parent_struct_def = parent_struct_type.decl
         indent = self._BASIC_INDENT * parent_struct_node.depth
 
         field_name = die.attributes['DW_AT_name'].value.decode('utf-8')
