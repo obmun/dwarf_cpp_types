@@ -310,7 +310,12 @@ class TypesExtractor:
         return qualified_type
 
     @staticmethod
-    def _process_enum_type(die: DIE, scope_node: ScopeTreeNode, dependency: bool = False) -> None | Enumeration:
+    def _process_enumerator(enumerator_die: DIE) -> tuple[str, int]:
+        identifier = enumerator_die.attributes['DW_AT_name'].value.decode()
+        val = enumerator_die.attributes['DW_AT_const_value'].value
+        return identifier, val
+
+    def _process_enum_type(self, die: DIE, scope_node: ScopeTreeNode, dependency: bool = False) -> None | Enumeration:
         """
 
         :param die: The DIE containing the enum type definition. This type DIE must NOT have been processed before
@@ -323,10 +328,25 @@ class TypesExtractor:
         if 'DW_AT_name' not in die.attributes:
             logging.info("Ignoring unnamed DIE @{}".format(die.offset))
             return None
-
         name = die.attributes['DW_AT_name'].value.decode("utf-8")
 
-        return Enumeration(name)
+        enum = Enumeration(name)
+        if not 'DW_AT_type' in die.attributes:
+            raise RuntimeError('Missing underlying type attr in enum type DIE')
+        referenced_type = self._process_type_attr(die, scope_node)
+        # TODO: ^^ Is the scope of the parent the correct one to pass to the underlying type?
+        if not referenced_type:
+            logging.warning(f"Could not recover underlying for enum {name}")
+        if not isinstance(referenced_type, PrimitiveType):
+            logging.warning(f"Underlying type for enum {name} is not a primitive type")
+        enum.underlying_type = referenced_type
+
+        for child_die in die.iter_children():
+            if child_die.tag != 'DW_TAG_enumerator':
+                continue
+            enum.add_value(*self._process_enumerator(child_die))
+
+        return enum
 
     @staticmethod
     def array_matcher(type_name: str) -> bool:
@@ -517,3 +537,10 @@ class TypesExtractor:
             for child in die.iter_children():
                 # Let's continue recursing non-member DIEs (e.g. other nested namespaces)
                 self._maybe_recurse_scope_die(child, scope)
+
+    # def _recurse_all_dies(self, start: DIE):
+    #     assert start.offset not in self._die_offset_test
+    #     self._die_offset_test.add(start.offset)
+    #     for child in start.iter_children():
+    #         # Let's continue recursing non-member DIEs (e.g. other nested namespaces)
+    #         self._recurse_all_dies(child)

@@ -2,7 +2,7 @@
 TYpe definitions for the STL types
 """
 
-from .defs import GenericPointer, StructType, TypeDef
+from .defs import _GenericPointer, StructType, TypeDef
 
 
 class Container(TypeDef):
@@ -62,13 +62,13 @@ class Array(SequenceContainer, StructType):
         StructType.__init__(self, name)
 
 
-class SmartPtr(GenericPointer, StructType):
+class SmartPtr(_GenericPointer, StructType):
     """A pointer that is an STL smart_ptr
 
     We inherit from StructType because all C++ smart ptrs are also classes.
     """
     def __init__(self, name: str):
-        GenericPointer.__init__(self)
+        _GenericPointer.__init__(self)
         StructType.__init__(self, name)
 
 

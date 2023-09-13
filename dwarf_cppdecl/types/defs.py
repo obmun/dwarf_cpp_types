@@ -73,6 +73,12 @@ class Void(TypeDef):
     def decl(self) -> str:
         return 'void'
 
+    def __repr__(self) -> str:
+        return self.decl
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
 
 class PrimitiveType(TypeDef):
     _decl: t.Any
@@ -97,7 +103,7 @@ class Enumeration(TypeDef):
     This is named type
     """
     _VALUES_T = dict[str, t.Any]
-    _underlying_type: None | PrimitiveType
+    underlying_type: None | PrimitiveType
     _values: _VALUES_T
 
     def __init__(self, name: str):
@@ -109,8 +115,11 @@ class Enumeration(TypeDef):
     def decl(self) -> _VALUES_T:
         return self._values
 
+    def add_value(self, identifier: 'str', value) -> None:
+        self._values[identifier] = value
+
     def __repr__(self):
-        return f'Enumeration({self._decl})'
+        return f'Enumeration({self.decl})'
 
     def __str__(self):
         return self.__repr__()
@@ -165,7 +174,7 @@ class TypeReference(TypeDef):
             case self.RefType.ALIAS:
                 ref_type_str = 'alias'
             case self.RefType.TYPEDEF:
-                ref_type_str = 'alias'
+                ref_type_str = 'typedef'
             case self.RefType.UNK:
                 ref_type_str = '~UNK_ref~'
 
@@ -253,7 +262,7 @@ class StructType(CompoundType, Scope):
         return self.__repr__()
 
 
-class GenericPointer(TypeDef):
+class _GenericPointer(TypeDef):
     """A type representing any pointer (C or C++ smart_ptr)
     """
     # We use the same nomenclature as the STL. Check the shared_ptr
@@ -266,24 +275,31 @@ class GenericPointer(TypeDef):
         self._element_type = None
 
     @property
-    def element_type(self) -> TypeDef:
+    def element_type(self) -> None | TypeDef:
         """The type of the pointer (i.e, the type pointed to)
 
-        :return: the type definition
+        :return: the type definition, or None if it has not been set yet
         """
-        if not self._element_type:
-            raise RuntimeError('element_type MUST be set before trying to get it')
         return self._element_type
 
     @element_type.setter
     def element_type(self, element_type: TypeDef):
         self._element_type = element_type
 
-    @TypeDef.decl.getter
-    def decl(self) -> str:
-        return self.element_type.decl + '*'
 
-
-class CPointer(GenericPointer):
+class CPointer(_GenericPointer):
     def __init__(self):
         super().__init__()
+
+    @TypeDef.decl.getter
+    def decl(self) -> str:
+        elem_type_decl = self.element_type
+        if not elem_type_decl:
+            elem_type_decl = "~UNK~"
+        return f"({str(elem_type_decl)})*"
+
+    def __repr__(self) -> str:
+        return self.decl
+
+    def __str__(self):
+        return self.__repr__()
