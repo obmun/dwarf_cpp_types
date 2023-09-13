@@ -1,10 +1,7 @@
 from collections import namedtuple
-
 import elftools.dwarf.constants as dc
 import logging
-import numpy as np
 import typing as t
-from bidict import bidict
 from pathlib import Path
 
 from elftools.dwarf.die import DIE
@@ -18,23 +15,29 @@ from .types import stl
 from .utils import *
 
 
+def _ref_attr_to_die(attr: AttributeValue, die: DIE) -> DIE:
+    assert attr.form == 'DW_FORM_ref4'
+    # Perf DWARF standard, the DW_FORM_ref4 value is 'an offset from the first byte of the compilation header for the
+    # compilation unit'. Hence, the CU unit offset relative to the data stream MUST BE ADDED.
+    ref_addr = attr.value + die.cu.cu_offset
+    return die.dwarfinfo.get_DIE_from_refaddr(ref_addr, die.cu)
+
+
 class TypesExtractor:
     _BASIC_INDENT = '    '
     _CLASS_OR_STRUCT_TYPE_TAGS = ['DW_TAG_structure_type', 'DW_TAG_class_type']
     _QUALIFIER_TAGS = ['DW_TAG_const_type']
 
-    _scope_node_to_die_map: bidict['ScopeTreeNode', DIE]
-    _die_to_type_map: bidict[DIE, 'TypeDef']
-    # ^^ THIS IS FUCKED! I am holding the DIE instances in memory!!!
-    # TODO: I need a unique ID for each DIE. Maybe the offset?
+    _die_maps: DieMaps
     _scope_tree: ScopeTree
+    _die_offset_test = set
     types_whitelist: list[list[str]]
 
     def __init__(self):
-        self._scope_node_to_die_map = bidict()
-        self._die_to_type_map = bidict()
+        self._die_maps = None
         self._scope_tree = ScopeTree()
         self.types_whitelist = None
+        self._die_offset_test = set()
 
     def process(self, filename, types: t.Optional[list[str]] = None):
         """
@@ -57,6 +60,8 @@ class TypesExtractor:
             for cu_index, cu in enumerate(dwarf_info.iter_CUs()):
                 if cu_index > 0:
                     raise NotImplementedError("We do not support DWARF info containing multiple Compile Units")
+
+                self._die_maps = DieMaps(cu)
 
                 # Start with the top DIE, the root for this CU's DIE tree
                 top_die = cu.get_top_DIE()
@@ -120,7 +125,8 @@ class TypesExtractor:
             parent_die = die.get_parent()
 
         # TODO: here we will always be doing FIRST TIME processing of a type, right? We are processing the DIE type ...
-        # How are we gonna handle references to existing types? ATM we only handle Refs to structs... But I guess we will have refs to EVERYTHING
+        # How are we gonna handle references to existing types? ATM we only handle Refs to structs... But I guess we
+        # will have refs to EVERYTHING
 
         ret = None
         add_type_def_to_scope = False
@@ -167,7 +173,7 @@ class TypesExtractor:
                 pass
 
         if ret:
-            self._die_to_type_map[die] = ret
+            self._die_maps.add_type_die(die, ret)
             if add_type_def_to_scope:
                 scope_node.scope.structs[struct_type.name] = struct_type
         return ret
@@ -207,20 +213,19 @@ class TypesExtractor:
         """
         if attr.form != 'DW_FORM_ref4':
             raise RuntimeError(f'Do not know now how to handle ref of form {attr.form}')
-
-        ref_addr = attr.value + die.cu.cu_offset
-        type_die = die.dwarfinfo.get_DIE_from_refaddr(ref_addr, die.cu)
+        type_die = _ref_attr_to_die(attr, die)
+        # TODO: replace this with DIE.get_DIE_from_attribute !!!
 
         # As this is a type reference, we need to check if we processed the DIE already
-        existing_type = self._die_to_type_map.get(type_die)
+        existing_type = self._die_maps.get_type_from_die(type_die)
         if existing_type:
             return existing_type
 
         # New type. Process it
 
         parent_die = type_die.get_parent()
-        assert scope in self._scope_node_to_die_map
-        caller_provided_scope_die = self._scope_node_to_die_map[scope]
+        assert self._die_maps.has_scope(scope)
+        caller_provided_scope_die = self._die_maps.get_die_for_scope(scope)
         if caller_provided_scope_die != parent_die:
             # This is a reference to a type in a different scope.
             # 1) We need to parent the referenced type to its CORRECT scope
@@ -237,7 +242,7 @@ class TypesExtractor:
                 #     Probably for dedup?
                 #   - E.g.: for a member of a struct of type `int16 *ptr;` this has been the case.
             else:
-                if parent_die not in self._scope_node_to_die_map.inverse:
+                if not self._die_maps.has_scope_die(parent_die):
                     # Not processed before! Time to do it now!
 
                     # ADD a filter to blackslit:
@@ -245,7 +250,7 @@ class TypesExtractor:
                     # 2. std:: types by default, except certain accepted types (the ones from the stl_processors)
                     raise NotImplementedError()
                 else:
-                    scope = self._scope_node_to_die_map.inverse[parent_die]
+                    self._die_maps.get_scope_from_die(parent_die)
 
         return self._process_type_die(type_die, scope, True)
 
@@ -431,8 +436,8 @@ class TypesExtractor:
 
             struct_type = type_cls(name)
             struct_type_node = scope_node.add_child(struct_type)
-            assert struct_type_node not in self._scope_node_to_die_map
-            self._scope_node_to_die_map[struct_type_node] = die
+            assert not self._die_maps.has_scope(struct_type_node)
+            self._die_maps.add_scope_die(die, struct_type_node)
 
             return struct_type, struct_type_node
 
@@ -482,7 +487,7 @@ class TypesExtractor:
         match die.tag:
             case 'DW_TAG_compile_unit':
                 # Register the CU DIE to the root scope
-                self._scope_node_to_die_map[self._scope_tree.root] = die
+                self._die_maps.add_scope_die(die, self._scope_tree.root)
 
             case 'DW_TAG_namespace':
                 assert len(curr_scope_full_path) == scope.depth
@@ -490,12 +495,13 @@ class TypesExtractor:
 
                 new_ns = Namespace(name)
                 if is_ns_blacklisted(scope.build_child_scope_path(new_ns)):
-                    # We will NOT process the children (types or nested NSs) of this scope. But we will still add it to the graph, as blacklisted
+                    # We will NOT process the children (types or nested NSs) of this scope. But we will still add it
+                    # to the graph, as blacklisted
                     new_ns.blacklisted = True
                     recurse = False
                 scope = scope.add_child(new_ns)
-                assert scope not in self._scope_node_to_die_map
-                self._scope_node_to_die_map[scope] = die
+                assert not self._die_maps.has_scope(scope)
+                self._die_maps.add_scope_die(die, scope)
 
             case t if t in self._CLASS_OR_STRUCT_TYPE_TAGS:
                 # We call _maybe_process_struct_or_class_type always THRU the _process_type_die main entry point

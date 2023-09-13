@@ -2,8 +2,7 @@
 Support for the creation of trees of scopes containing type definitions
 """
 
-print(__name__, __package__)
-
+from __future__ import annotations
 from annotated_types import Ge
 import typing as t
 from typing import Annotated
@@ -15,7 +14,11 @@ class Scope:
     """Anything that can contain other elements
     """
     _name: str
-    structs: dict[str, 'StructType']
+    # We would like to use type annotations in this dict. It would look like
+    #   structs: dict[str, StructType]
+    # The problem is that this would create a circular dep. Instead, we make our life easier.
+    # See at the end of this file.
+    structs: dict[str, t.Any]
 
     def __init__(self, name: str):
         self._name = name
@@ -131,7 +134,7 @@ class ScopeTree:
     def flatten(self):
         ret = {}
 
-        def add_structs_to_dict(scope_path: str, name: str, s: StructType):
+        def add_structs_to_dict(scope_path: str, name: str, s):
             nonlocal ret
             ret[self._SCOPE_SEPARATOR.join((scope_path, name))] = s
 
@@ -143,4 +146,5 @@ class ScopeTree:
 # We are using a forward declaration of this class. In order to avoid the circular import, just move the full
 # definition import until the end of the module, so the module is fully populated before we bring the evaluation of
 # types.defs
-from .types.defs import StructType
+#from .types.defs import StructType
+# ^^ This does not always work. Try to import types.defs :D

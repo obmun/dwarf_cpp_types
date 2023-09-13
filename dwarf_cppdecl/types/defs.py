@@ -4,11 +4,11 @@ Definitions for the base C++ types
 Enables the user of the module to create an instance of a class describing a concrete C++ type.
 Definitions for the STL types are found in its dedicated module.
 """
-from enum import Enum
 
-from ..scope import Scope
+from enum import Enum
 import numpy as np
 import typing as t
+from ..scope import Scope
 
 
 class Qualifier:
