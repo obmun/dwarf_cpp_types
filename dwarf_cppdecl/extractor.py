@@ -249,7 +249,7 @@ class TypesExtractor:
                     # 2. std:: types by default, except certain accepted types (the ones from the stl_processors)
                     raise NotImplementedError()
                 else:
-                    self._die_maps.get_scope_from_die(parent_die)
+                    scope = self._die_maps.get_scope_from_die(parent_die)
 
         return self._process_type_die(type_die, scope, True)
 
