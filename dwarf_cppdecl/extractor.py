@@ -129,7 +129,6 @@ class TypesExtractor:
         # will have refs to EVERYTHING
 
         ret = None
-        add_type_def_to_scope = False
         match die.tag:
             case 'DW_TAG_base_type':
                 ret = self._dwarf_base_type_to_py_type(die)
@@ -174,8 +173,8 @@ class TypesExtractor:
 
         if ret:
             self._die_maps.add_type_die(die, ret)
-            if add_type_def_to_scope:
-                scope_node.scope.structs[struct_type.name] = struct_type
+            if ret.is_named():
+                scope_node.scope.named_types[ret.name] = ret
         return ret
 
     def _process_c_pointer(self, die: DIE, scope: ScopeTreeNode) -> CPointer:
@@ -530,7 +529,7 @@ class TypesExtractor:
                 recurse = False
 
             case other:
-                logging.info("Ignoring DIE '{}' of unhandled type '{}'".format(name if name else "UNNAMED", die.tag))
+                logging.debug("Ignoring DIE '{}' of ignored type '{}'".format(name if name else "UNNAMED", die.tag))
                 recurse = False
 
         if recurse:

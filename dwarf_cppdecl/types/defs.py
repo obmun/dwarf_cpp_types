@@ -8,6 +8,7 @@ Definitions for the STL types are found in its dedicated module.
 from enum import Enum
 import numpy as np
 import typing as t
+from .._helpers import _Base
 from ..scope import Scope
 
 
@@ -20,7 +21,7 @@ class Const(Qualifier):
     pass
 
 
-class TypeDef:
+class TypeDef(_Base):
     """Base class for any type definition in C++
 
     `name` and `decl` properties
@@ -45,7 +46,11 @@ class TypeDef:
     _name: None | str
 
     def __init__(self, name: (None | str) = None):
+        # Needed for MRO chain in multi-parents
+        super().__init__(name)
         self._name = name
+        if (name is not None) and not name:
+            raise ValueError("Name can be None, but not an empty")
         pass
 
     @property
@@ -59,6 +64,9 @@ class TypeDef:
     @property
     def name(self) -> None | str:
         return self._name
+
+    def is_named(self) -> bool:
+        return self.name is not None
 
 
 class Void(TypeDef):
@@ -190,7 +198,7 @@ class QualifiedType(TypeDef):
     """A type with qualifiers
 
     A qualifier always applies to an EXISTING type. You cannot do this through multiple inheritance, as the "TypeDef"
-    instance defining the un-qualified (original) type MUST exist as well. I.e.: you ALWYAS need a reference to an
+    instance defining the un-qualified (original) type MUST exist as well. I.e.: you ALWAYS need a reference to an
     existing original type.
     """
     _dest: TypeDef
@@ -209,13 +217,15 @@ class QualifiedType(TypeDef):
 class CompoundType(TypeDef):
     """As per C++ std, Compound types [basic.compound]
     """
-    pass
+
+    def __init__(self, name):
+        super().__init__(name)
 
 
 class StructDeclaration:
     """A declaration of a struct, containing various fields (AKA members)
 
-    In this code, we are NOT interested in methods of the struct. Hence, they are ignored
+    In this package, we are NOT interested in methods of the struct. Hence, they are ignored.
     """
     fields: dict[str, TypeDef]
 
@@ -242,9 +252,8 @@ class StructType(CompoundType, Scope):
         """
         :param name: The name of this struct (also scope name)
         """
-        CompoundType.__init__(self, name)
-        # ^^^ TODO: add the ClassType, and replace this hardcoded struct with class keyword
-        Scope.__init__(self, name)
+        super().__init__(name)
+
         self._declaration = StructDeclaration()
 
     @property
@@ -256,7 +265,7 @@ class StructType(CompoundType, Scope):
         self._declaration = decl
 
     def __repr__(self):
-        return f'Struct({self._declaration})'
+        return f'Struct({self.decl})'
 
     def __str__(self):
         return self.__repr__()

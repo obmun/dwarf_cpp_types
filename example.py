@@ -6,7 +6,7 @@ from dwarf_cppdecl.extractor import TypesExtractor
 if __name__ == '__main__':
     logger = logging.getLogger(__name__)
     FORMAT = "%(levelname)s:%(name)s:%(funcName)s - %(message)s"
-    logging.basicConfig(format=FORMAT, level=logging.DEBUG)
+    logging.basicConfig(format=FORMAT, level=logging.INFO)
 
     if len(sys.argv) < 2:
         print('Expected usage: {0} <executable>'.format(sys.argv[0]))

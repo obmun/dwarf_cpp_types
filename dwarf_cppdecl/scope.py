@@ -4,25 +4,32 @@ Support for the creation of trees of scopes containing type definitions
 
 from __future__ import annotations
 from annotated_types import Ge
+from ._helpers import _Base
 import typing as t
 from typing import Annotated
 
 UInt = Annotated[int, Ge(0)]
 
 
-class Scope:
+class Scope(_Base):
     """Anything that can contain other elements
     """
     _name: str
+
+    named_types: dict[str, t.Any]
+    """Named type-defs of this cope
+    
+    Contains any named type-definition whose parent is this scope. This of course includes struct declarations.
+    """
     # We would like to use type annotations in this dict. It would look like
     #   structs: dict[str, StructType]
     # The problem is that this would create a circular dep. Instead, we make our life easier.
     # See at the end of this file.
-    structs: dict[str, t.Any]
 
     def __init__(self, name: str):
+        super().__init__(name)
         self._name = name
-        self.structs = {}
+        self.named_types = {}
 
     @property
     def name(self):
@@ -128,7 +135,7 @@ class ScopeTree:
         for child in node.children:
             ScopeTree._depth_first_visit(child, struct_visitor)
         scope_path = cls._SCOPE_SEPARATOR.join(node.get_path())
-        for name, s in node.scope.structs.items():
+        for name, s in node.scope.named_types.items():
             struct_visitor(scope_path, name, s)
 
     def flatten(self):
