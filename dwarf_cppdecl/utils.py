@@ -120,12 +120,17 @@ def print_siblings(die: DIE) -> None:
 def get_child(die: DIE, tag: str, name: str) -> None | DIE:
     """Retrieves a child of the given tag and with the given name
 
+    :param name: The name of the child to fetch. If the empty string, the FIRST child matching the tag will be returned.
     :return:
     """
     matching_die = None
     for child_die in die.iter_children():
         if child_die.tag != tag:
             continue
+
+        if name == "":
+            return child_die
+
         name_attr = child_die.attributes.get('DW_AT_name')
         if not name_attr:
             continue
@@ -134,6 +139,20 @@ def get_child(die: DIE, tag: str, name: str) -> None | DIE:
         matching_die = child_die
         break
     return matching_die
+
+
+def count_children(die: DIE, tag: str) -> int:
+    """Counts the # of children with the given tag
+
+    :param die:
+    :param tag:
+    :return:
+    """
+    count = 0
+    for child_die in die.iter_children():
+        if child_die.tag == tag:
+            count += 1
+    return count
 
 
 from .types.defs import TypeDef

@@ -376,12 +376,20 @@ class TypesExtractor:
         value_type_typedef_child_die = get_child(die, 'DW_TAG_typedef', 'value_type')
         value_type = self._process_typedef(value_type_typedef_child_die, struct_node)
         type_instance.value_type = value_type
-        # For the moment, stop further processing of this type
+
+        # For the moment, stop further processing (children) of this type
         return self._STLProcessorResult(process_members=False)
 
     def array_processor(self, array: stl.Array, die: DIE,
                         array_struct_node: StructScopeTreeNode) -> _STLProcessorResult:
-        return self.array_or_vector_processor(array, die, array_struct_node)
+        ret = self.array_or_vector_processor(array, die, array_struct_node)
+        assert count_children(die, 'DW_TAG_template_value_param') == 1
+        # Luckily the template has ONLY 1 value argument. Otherwise, we cannot rely on the "name"!!!
+        # In the STL, the size arg is normall called N. But in the libstdc++ they went for _Nm :D
+        size_die = get_child(die, 'DW_TAG_template_value_param', '')
+        size = size_die.attributes['DW_AT_const_value'].value
+        array.size = size
+        return ret
 
     def string_processor(self, string: stl.String, die: DIE, struct_node: StructScopeTreeNode) -> _STLProcessorResult:
         logging.error("Not yet implemented")
@@ -394,6 +402,7 @@ class TypesExtractor:
 
     def vector_processor(self, vector: stl.Vector, die: DIE,
                          vector_struct_node: StructScopeTreeNode) -> _STLProcessorResult:
+        # A vector obviously does not have a "size" we can read from DWARF, as it is dynamic
         return self.array_or_vector_processor(vector, die, vector_struct_node)
 
     _STLClassProcessorsEntry = namedtuple('STLClassProcessorsEntry', 'type_class processor')
